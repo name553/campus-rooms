@@ -1,13 +1,42 @@
 """Учебный API для бронирования аудиторий."""
 
+from contextlib import asynccontextmanager
 from datetime import date as Date, time as Time
+import logging
+import os
+from pathlib import Path as FilePath
 from threading import Lock
 
-from fastapi import FastAPI, HTTPException, Path, Query, Response
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 VERSION = "1.0.0"
-app = FastAPI(title="Бронирование аудиторий", version=VERSION)
+load_dotenv(FilePath(__file__).with_name(".env"))
+APP_NAME = os.getenv("APP_NAME", "Бронирование аудиторий").strip() or "Бронирование аудиторий"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    LOG_LEVEL = "INFO"
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("classroom_booking")
+logger.setLevel(LOG_LEVEL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("service_start app=%s version=%s", APP_NAME, VERSION)
+    yield
+    logger.info("service_stop")
+
+
+app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    response = await call_next(request)
+    logger.info("request method=%s path=%s status=%s", request.method, request.url.path, response.status_code)
+    return response
 
 
 class Room(BaseModel):
@@ -62,7 +91,7 @@ def health():
 
 @app.get("/version", tags=["Диагностика"])
 def version():
-    return {"version": VERSION}
+    return {"version": VERSION, "app_name": APP_NAME}
 
 
 @app.get("/rooms", response_model=list[Room], tags=["Аудитории"])
@@ -92,11 +121,13 @@ def create_booking(data: BookingCreate):
                 and data.end_time > existing.start_time
             )
             if same_room_and_day and overlaps:
+                logger.info("booking_conflict room=%s date=%s", data.room_id, data.date)
                 raise HTTPException(status_code=409, detail="Аудитория занята в это время")
 
         booking = Booking(id=next_booking_id, **data.model_dump())
         bookings[booking.id] = booking
         next_booking_id += 1
+        logger.info("booking_created id=%s room=%s date=%s", booking.id, booking.room_id, booking.date)
         return booking
 
 
@@ -125,4 +156,5 @@ def cancel_booking(booking_id: int = Path(gt=0)):
     with store_lock:
         if bookings.pop(booking_id, None) is None:
             raise HTTPException(status_code=404, detail="Бронирование не найдено")
+    logger.info("booking_cancelled id=%s", booking_id)
     return Response(status_code=204)
